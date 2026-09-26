@@ -4,7 +4,10 @@
 allowance 与结转上限 carry_cap 定义：
 
 - 时刻 t 所在周期编号为 floor((t - anchor) / period_seconds)，周期 k 的
-  半开区间为 [anchor + k·period_seconds, anchor + (k+1)·period_seconds)；
+  半开区间为 [anchor + k·period_seconds, anchor + (k+1)·period_seconds)。
+  周期归属与周期区间均按输入的**十进制**数值计算（Decimal(str(值))），
+  避免二进制浮点商（如 0.3/0.1 = 2.9999999999999996）把恰好落在边界上的
+  请求错归上一周期；
 - 策略在**首次被请求触及的那个周期**开始时拥有 base = allowance、carry = 0；
 - 时间推进到更后的周期时逐期结转：旧 carry 立即失效，上一周期未用的基础
   额度结转为新周期的 carry（不超过 carry_cap），新周期的 base 重置为
@@ -17,7 +20,7 @@ allowance 与结转上限 carry_cap 定义：
 """
 from __future__ import annotations
 
-import math
+from decimal import ROUND_FLOOR, Decimal
 
 from app.models.common import EPS, BucketBalance
 from app.models.windows.rollover import (
@@ -53,15 +56,23 @@ def rollover_simulate(payload: RolloverSimulateRequest) -> RolloverSimulateRespo
     carry_cap = {p.id: float(p.carry_cap) for p in payload.policies}
     policy_ids = [p.id for p in payload.policies]
 
+    # 周期归属按输入的十进制时间值判定：str() 还原调用方给出的十进制数值，
+    # 使半开周期 [start, end) 的边界在十进制下精确对齐——例如 period_seconds=0.1
+    # 时 t=0.3 属于周期 3，而二进制浮点商 0.3/0.1 = 2.9999999999999996 会错归周期 2
+    anchor_dec = {p.id: Decimal(str(p.anchor)) for p in payload.policies}
+    period_dec = {p.id: Decimal(str(p.period_seconds)) for p in payload.policies}
+
     def period_index(pid: str, now: float) -> int:
-        return math.floor((now - anchor[pid]) / period_seconds[pid])
+        offset = Decimal(str(now)) - anchor_dec[pid]
+        quotient = offset / period_dec[pid]
+        return int(quotient.to_integral_value(rounding=ROUND_FLOOR))
 
     def period_window(pid: str, index: int) -> PeriodRange:
-        start = anchor[pid] + index * period_seconds[pid]
+        start = anchor_dec[pid] + index * period_dec[pid]
         return PeriodRange(
             index=index,
-            start=_round(start),
-            end=_round(start + period_seconds[pid]),
+            start=_round(float(start)),
+            end=_round(float(start + period_dec[pid])),
         )
 
     # 延迟初始化：策略首次被请求触及时，按其所在周期以满额起步、无结转
