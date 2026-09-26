@@ -199,6 +199,138 @@ def test_negative_period_index_with_anchor_after_timestamp():
     assert (v.period_window.start, v.period_window.end) == (0, 10)
 
 
+# ---------- 小数周期边界 ----------
+
+def test_fractional_period_boundary_enters_new_period():
+    # 回归：anchor=0、period_seconds=0.1 时 t=0.3 曾被二进制浮点误差
+    # （0.3/0.1 = 2.9999999999999996）错归周期 2 而拒绝；按十进制值判定
+    # 后 t=0.3 恰好是周期 3 起点，进入新周期获得满额 base
+    resp = _run(
+        [{"id": "P", "anchor": 0, "period_seconds": 0.1, "allowance": 1, "carry_cap": 0}],
+        [
+            {"id": "r1", "timestamp": 0.2, "cost": 1, "policy_refs": ["P"]},
+            {"id": "r2", "timestamp": 0.3, "cost": 1, "policy_refs": ["P"]},
+        ],
+    )
+    assert [r.allowed for r in resp.results] == [True, True]
+    v1 = _view(resp.results[0], "P")
+    assert v1.period == 2
+    assert (v1.period_window.start, v1.period_window.end) == (0.2, 0.3)
+    assert (v1.balances.base.before, v1.balances.base.after) == (1, 0)
+    v2 = _view(resp.results[1], "P")
+    assert v2.period == 3
+    assert (v2.period_window.start, v2.period_window.end) == (0.3, 0.4)
+    assert (v2.balances.base.before, v2.balances.base.after) == (1, 0)
+    assert (v2.balances.carry.before, v2.balances.carry.after) == (0, 0)
+    p = resp.policies[0]
+    assert p.period == 3
+    assert (p.period_window.start, p.period_window.end) == (0.3, 0.4)
+    assert (p.base, p.carry, p.available) == (0, 0, 0)
+
+
+def test_fractional_period_adjacent_non_boundary_moments():
+    # 边界两侧的相邻非边界时刻归属不变：0.299999999 仍属周期 2（余额已耗尽
+    # 而拒绝），0.300000001 属周期 3；逐项 period/period_window 与终态一致
+    resp = _run(
+        [{"id": "P", "anchor": 0, "period_seconds": 0.1, "allowance": 1, "carry_cap": 0}],
+        [
+            {"id": "r1", "timestamp": 0.2, "cost": 1, "policy_refs": ["P"]},
+            {"id": "r2", "timestamp": 0.299999999, "cost": 1, "policy_refs": ["P"]},
+            {"id": "r3", "timestamp": 0.3, "cost": 1, "policy_refs": ["P"]},
+            {"id": "r4", "timestamp": 0.300000001, "cost": 1, "policy_refs": ["P"]},
+        ],
+    )
+    assert [r.allowed for r in resp.results] == [True, False, True, False]
+    v2 = _view(resp.results[1], "P")
+    assert v2.period == 2
+    assert (v2.period_window.start, v2.period_window.end) == (0.2, 0.3)
+    rej2 = resp.results[1].rejection
+    assert rej2.period == 2
+    assert (rej2.period_window.start, rej2.period_window.end) == (0.2, 0.3)
+    assert (rej2.available, rej2.shortage) == (0, 1)
+    v3 = _view(resp.results[2], "P")
+    assert v3.period == 3
+    assert (v3.period_window.start, v3.period_window.end) == (0.3, 0.4)
+    v4 = _view(resp.results[3], "P")
+    assert v4.period == 3
+    assert (v4.period_window.start, v4.period_window.end) == (0.3, 0.4)
+    rej4 = resp.results[3].rejection
+    assert rej4.period == 3
+    assert (rej4.period_window.start, rej4.period_window.end) == (0.3, 0.4)
+    p = resp.policies[0]
+    assert p.period == 3 and (p.base, p.carry) == (0, 0)
+
+
+def test_fractional_period_boundary_rollover_carry():
+    # 跨期时旧 carry 失效、上期未用 base 按 carry_cap 结转、本期 base 重置，
+    # 在小数周期边界上同样成立
+    resp = _run(
+        [{"id": "P", "anchor": 0, "period_seconds": 0.1, "allowance": 1, "carry_cap": 0.5}],
+        [
+            {"id": "r1", "timestamp": 0.2, "cost": 0.4, "policy_refs": ["P"]},
+            {"id": "r2", "timestamp": 0.3, "cost": 0.8, "policy_refs": ["P"]},
+        ],
+    )
+    assert all(r.allowed for r in resp.results)
+    v = _view(resp.results[1], "P")
+    assert v.period == 3
+    assert (v.period_window.start, v.period_window.end) == (0.3, 0.4)
+    # 周期 2 未用 base 0.6 → carry = min(0.5, 0.6) = 0.5；cost 0.8 先扣 carry 再扣 base
+    assert (v.balances.carry.before, v.balances.carry.after) == (0.5, 0)
+    assert (v.balances.base.before, v.balances.base.after) == (1, 0.7)
+    p = resp.policies[0]
+    assert p.period == 3 and (p.base, p.carry, p.available) == (0.7, 0, 0.7)
+
+
+def test_fractional_period_with_fractional_anchor():
+    # 小数锚点：anchor=0.2、period=0.1 时 t=0.5 恰好是周期 3 起点
+    resp = _run(
+        [{"id": "P", "anchor": 0.2, "period_seconds": 0.1, "allowance": 1, "carry_cap": 0}],
+        [
+            {"id": "r1", "timestamp": 0.4, "cost": 1, "policy_refs": ["P"]},
+            {"id": "r2", "timestamp": 0.5, "cost": 1, "policy_refs": ["P"]},
+        ],
+    )
+    assert [r.allowed for r in resp.results] == [True, True]
+    v1 = _view(resp.results[0], "P")
+    assert v1.period == 2
+    assert (v1.period_window.start, v1.period_window.end) == (0.4, 0.5)
+    v2 = _view(resp.results[1], "P")
+    assert v2.period == 3
+    assert (v2.period_window.start, v2.period_window.end) == (0.5, 0.6)
+    p = resp.policies[0]
+    assert p.period == 3 and (p.base, p.carry) == (0, 0)
+
+
+def test_fractional_period_multi_policy_atomic_rejection():
+    # 同一时刻 A 跨入新周期（0.3/0.1 = 3）而 B 仍在旧周期（0.3/0.2 = 1.5）：
+    # B 不足 → 原子拒绝，已跨期的 A 余额不被扣减
+    resp = _run(
+        [
+            {"id": "A", "anchor": 0, "period_seconds": 0.1, "allowance": 1, "carry_cap": 0},
+            {"id": "B", "anchor": 0, "period_seconds": 0.2, "allowance": 1, "carry_cap": 0},
+        ],
+        [
+            {"id": "r1", "timestamp": 0.2, "cost": 1, "policy_refs": ["A", "B"]},
+            {"id": "r2", "timestamp": 0.3, "cost": 1, "policy_refs": ["A", "B"]},
+        ],
+    )
+    assert [r.allowed for r in resp.results] == [True, False]
+    r2 = resp.results[1]
+    assert r2.rejected_by == "B"
+    va = _view(r2, "A")
+    assert va.period == 3
+    assert (va.period_window.start, va.period_window.end) == (0.3, 0.4)
+    assert (va.balances.base.before, va.balances.base.after) == (1, 1)
+    vb = _view(r2, "B")
+    assert vb.period == 1
+    assert (vb.period_window.start, vb.period_window.end) == (0.2, 0.4)
+    assert (vb.balances.base.before, vb.balances.base.after) == (0, 0)
+    states = {p.id: p for p in resp.policies}
+    assert (states["A"].period, states["A"].base, states["A"].carry) == (3, 1, 0)
+    assert (states["B"].period, states["B"].base, states["B"].carry) == (1, 0, 0)
+
+
 # ---------- 拒绝与原子性 ----------
 
 def test_insufficient_total_balance_is_rejected_with_reason():
@@ -550,6 +682,34 @@ def test_http_rollover_simulate_ok():
     assert (states["p10"]["base"], states["p10"]["carry"]) == (1.0, 0.0)
     assert states["p7"]["period"] == 1
     assert (states["p7"]["base"], states["p7"]["carry"]) == (2.0, 0.0)
+
+
+def test_http_rollover_fractional_period_boundary():
+    # 回归：小数周期边界请求按十进制时间值归入右侧新周期
+    response = client.post(
+        "/rollover-simulate",
+        json={
+            "policies": [
+                {"id": "P", "anchor": 0, "period_seconds": 0.1,
+                 "allowance": 1, "carry_cap": 0}
+            ],
+            "requests": [
+                {"id": "r1", "timestamp": 0.2, "cost": 1, "policy_refs": ["P"]},
+                {"id": "r2", "timestamp": 0.3, "cost": 1, "policy_refs": ["P"]},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [r["allowed"] for r in data["results"]] == [True, True]
+    view = data["results"][1]["policies"]["P"]
+    assert view["period"] == 3
+    assert view["period_window"] == {"index": 3, "start": 0.3, "end": 0.4}
+    assert view["balances"]["base"] == {"before": 1.0, "after": 0.0}
+    state = data["policies"][0]
+    assert state["period"] == 3
+    assert state["period_window"] == {"index": 3, "start": 0.3, "end": 0.4}
+    assert (state["base"], state["carry"], state["available"]) == (0.0, 0.0, 0.0)
 
 
 def test_http_validation_error_is_422():

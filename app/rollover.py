@@ -4,7 +4,10 @@
 allowance 与结转上限 carry_cap 定义：
 
 - 时刻 t 所在周期编号为 floor((t - anchor) / period_seconds)，周期 k 的
-  半开区间为 [anchor + k·period_seconds, anchor + (k+1)·period_seconds)；
+  半开区间为 [anchor + k·period_seconds, anchor + (k+1)·period_seconds)。
+  周期归属按输入的**十进制数值**精确判定（分数运算求 floor），不受二进制
+  浮点误差影响：period_seconds 可以是小数，边界上的请求进入右侧新周期
+  （如 anchor=0、period_seconds=0.1 时 t=0.3 属于周期 3 而非周期 2）；
 - 策略在**首次被请求触及的那个周期**开始时拥有 base = allowance、carry = 0；
 - 时间推进到更后的周期时逐期结转：旧 carry 立即失效，上一周期未用的基础
   额度结转为新周期的 carry（不超过 carry_cap），新周期的 base 重置为
@@ -17,7 +20,7 @@ allowance 与结转上限 carry_cap 定义：
 """
 from __future__ import annotations
 
-import math
+from fractions import Fraction
 
 from app.models.common import EPS, BucketBalance
 from app.models.windows.rollover import (
@@ -31,6 +34,16 @@ from app.models.windows.rollover import (
     RolloverSimulateResponse,
 )
 from app.simulation import _round
+
+
+def _exact_time(value: float) -> Fraction:
+    """输入时间/周期数值的十进制精确分数值。
+
+    JSON 数值解析为 float 后，str() 给出最短回环十进制表示（即调用方
+    输入的十进制值），据此构造的分数让周期归属判定不受二进制浮点误差
+    影响：0.3 / 0.1 恰好为 3，而不是 2.9999999999999996。
+    """
+    return Fraction(str(value))
 
 
 class _PolicyState:
@@ -53,21 +66,27 @@ def rollover_simulate(payload: RolloverSimulateRequest) -> RolloverSimulateRespo
     carry_cap = {p.id: float(p.carry_cap) for p in payload.policies}
     policy_ids = [p.id for p in payload.policies]
 
-    def period_index(pid: str, now: float) -> int:
-        return math.floor((now - anchor[pid]) / period_seconds[pid])
+    # 周期归属与周期区间按十进制精确值计算，保证小数周期（如 0.1 秒）的
+    # 边界时刻恰好整除、归入右侧新周期
+    anchor_x = {p.id: _exact_time(p.anchor) for p in payload.policies}
+    period_x = {p.id: _exact_time(p.period_seconds) for p in payload.policies}
+
+    def period_index(pid: str, now: Fraction) -> int:
+        # Fraction 的 // 即 floor 语义（负周期编号同样向负无穷取整）
+        return (now - anchor_x[pid]) // period_x[pid]
 
     def period_window(pid: str, index: int) -> PeriodRange:
-        start = anchor[pid] + index * period_seconds[pid]
+        start = anchor_x[pid] + index * period_x[pid]
         return PeriodRange(
             index=index,
-            start=_round(start),
-            end=_round(start + period_seconds[pid]),
+            start=_round(float(start)),
+            end=_round(float(start + period_x[pid])),
         )
 
     # 延迟初始化：策略首次被请求触及时，按其所在周期以满额起步、无结转
     states: dict[str, _PolicyState] = {}
 
-    def advance(pid: str, now: float) -> _PolicyState:
+    def advance(pid: str, now: Fraction) -> _PolicyState:
         """把策略推进到 now 所在周期（惰性跨期结转），返回最新状态。"""
         target = period_index(pid, now)
         state = states.get(pid)
@@ -101,13 +120,14 @@ def rollover_simulate(payload: RolloverSimulateRequest) -> RolloverSimulateRespo
     for i in order:
         request = requests[i]
         now = float(request.timestamp)
+        now_x = _exact_time(now)
         cost = float(request.cost)
 
         # 先把每个引用策略推进到当前周期（跨期结转作为时间推进，拒绝也会发生）
         before: dict[str, tuple[float, float]] = {}
         periods: dict[str, int] = {}
         for pid in request.policy_refs:
-            state = advance(pid, now)
+            state = advance(pid, now_x)
             before[pid] = (state.base, state.carry)
             periods[pid] = state.period
 
@@ -186,10 +206,11 @@ def rollover_simulate(payload: RolloverSimulateRequest) -> RolloverSimulateRespo
 
     # 终态：以最后一个请求时间戳为观察时刻，各策略推进到其所在周期
     t_end = max(float(request.timestamp) for request in requests)
+    t_end_x = _exact_time(t_end)
 
     final_states: list[RolloverPolicyFinalState] = []
     for pid in policy_ids:
-        state = advance(pid, t_end)
+        state = advance(pid, t_end_x)
         final_states.append(
             RolloverPolicyFinalState(
                 id=pid,
